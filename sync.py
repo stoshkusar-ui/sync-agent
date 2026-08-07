@@ -171,22 +171,33 @@ def find_and_download_email(cfg):
     return saved_path
 
 
-def parse_xlsx_categories(filepath):
+def parse_report_tree(filepath):
     """
-    Парсит иерархический сгруппированный отчёт 1С вида:
-        Строка 1-2: шапка (название организации, период)
-        Строка 3-6: параметры отбора/сортировки
-        Строка 8-9: заголовки таблицы (Контрагент/Номенклатура, Артикул,
-                    Количество реализации, Сумма реализации)
-        Строка 10+: иерархия групп (подразделение > район > контрагент >
-                    категория > товар), каждая со своей суммой в столбце "Сумма"
+    Парсит иерархический отчёт 1С, используя реальные уровни группировки
+    Excel (outline_level), а не визуальные отступы.
 
-    Возвращает (categories, grand_total):
-      categories  - dict {наименование товара: сумма} по строкам с заполненным
-                    Артикулом (это конечные позиции номенклатуры)
-      grand_total - сумма из первой строки данных под заголовком (это итог
-                    верхнего уровня группировки, например "Астана Подразделение")
+    Структура (подтверждена диагностикой файла):
+        level 0: "Астана Подразделение" (департамент, итоговая сумма)
+        level 1: менеджер/отдел
+        level 2: РАЙОН (для менеджеров с "МПП" в названии) ИЛИ сразу КЛИЕНТ
+                 (для внутренних отделов: Ремонт Астана, Розница Астана,
+                 Розница МСЦ, Сотрудники Астана — у них нет уровня "район")
+        level 3: клиент (для веток с районом) ИЛИ категория (для веток без района)
+        далее вглубь: категория/подкатегория/... /товар (строка с Артикулом)
+
+    Возвращает (grand_total, clients, products):
+        grand_total - число, сумма по всему департаменту
+        clients     - dict {(manager, client): сумма}
+        products    - dict {(manager, client): {(category, product): сумма}}
     """
+    # Отделы, где нет промежуточного уровня "район" между менеджером и клиентом
+    NO_DISTRICT_MANAGERS = {
+        "Ремонт Астана",
+        "Розница Астана",
+        "Розница МСЦ",
+        "Сотрудники Астана",
+    }
+
     wb = load_workbook(filepath, data_only=True)
     ws = wb.active
 
@@ -208,61 +219,139 @@ def parse_xlsx_categories(filepath):
             "(scanned first {} rows).".format(filepath, max_scan_rows)
         )
 
-    # Заголовок может занимать несколько строк из-за объединённых ячеек
-    # (напр. "Сумма" в одной строке, "Артикул"/"Количество" в следующей),
-    # поэтому сканируем небольшой блок строк начиная с header_row_idx.
-    col_qty = None
     col_article = None
     for r in range(header_row_idx, header_row_idx + 3):
         row_values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
         row_lower = [str(v).strip().lower() if v else "" for v in row_values]
-        if col_qty is None:
-            idx = next((i for i, v in enumerate(row_lower) if "количество" in v), None)
-            if idx is not None:
-                col_qty = idx + 1
-        if col_article is None:
-            idx = next((i for i, v in enumerate(row_lower) if "артикул" in v), None)
-            if idx is not None:
-                col_article = idx + 1
+        idx = next((i for i, v in enumerate(row_lower) if "артикул" in v), None)
+        if idx is not None:
+            col_article = idx + 1
+            break
 
-    col_name = 1  # столбец A: иерархическое наименование (Контрагент/Номенклатура)
-
-    # Итог верхнего уровня группировки — первая строка ниже заголовка,
-    # где есть числовое значение в колонке "Сумма" (заголовок может занимать
-    # несколько строк из-за объединённых ячеек, поэтому не полагаемся на
-    # наличие текста в колонке с названием)
     grand_total = None
+    clients = {}
+    products = {}
+    path = {}
+    current_manager = None
+    current_client = None
+
     for r in range(header_row_idx + 1, ws.max_row + 1):
+        level = ws.row_dimensions[r].outline_level if r in ws.row_dimensions else 0
+        name = ws.cell(row=r, column=1).value
+        if name is None:
+            continue
+        name = str(name).strip()
+
         sum_val = ws.cell(row=r, column=col_sum).value
-        if sum_val is None:
+        article = ws.cell(row=r, column=col_article).value if col_article else None
+
+        path[level] = name
+        for lv in list(path.keys()):
+            if lv > level:
+                del path[lv]
+
+        if level == 0:
+            if grand_total is None and sum_val is not None:
+                try:
+                    grand_total = float(sum_val)
+                except (TypeError, ValueError):
+                    pass
             continue
-        try:
-            grand_total = float(sum_val)
-        except (TypeError, ValueError):
+
+        if level == 1:
+            current_manager = name
+            current_client = None
             continue
-        break
+
+        if level == 2:
+            if current_manager in NO_DISTRICT_MANAGERS:
+                current_client = name
+                if sum_val is not None:
+                    try:
+                        clients[(current_manager, current_client)] = float(sum_val)
+                    except (TypeError, ValueError):
+                        pass
+            continue
+
+        if level == 3:
+            if current_manager not in NO_DISTRICT_MANAGERS:
+                current_client = name
+                if sum_val is not None:
+                    try:
+                        clients[(current_manager, current_client)] = float(sum_val)
+                    except (TypeError, ValueError):
+                        pass
+            continue
+
+        # Уровни глубже клиента: категории/подкатегории/товары
+        if article and current_manager and current_client and sum_val is not None:
+            category = path.get(level - 1, "")
+            try:
+                amount = float(sum_val)
+            except (TypeError, ValueError):
+                continue
+            key = (current_manager, current_client)
+            products.setdefault(key, {})
+            pkey = (category, name)
+            products[key][pkey] = products[key].get(pkey, 0.0) + amount
 
     if grand_total is None:
         raise ValueError("Could not find top-level total row in {}".format(filepath))
 
-    # Детализация: берём только строки с заполненным Артикулом (конечные товары)
-    categories = {}
-    for r in range(header_row_idx + 1, ws.max_row + 1):
-        article = ws.cell(row=r, column=col_article).value if col_article else None
-        if not article:
-            continue
-        name = ws.cell(row=r, column=col_name).value
-        sum_val = ws.cell(row=r, column=col_sum).value
-        if name is None or sum_val is None:
-            continue
-        name = str(name).strip()
-        try:
-            sum_val = float(sum_val)
-        except (TypeError, ValueError):
-            continue
-        categories[name] = categories.get(name, 0.0) + sum_val
+    return grand_total, clients, products
 
-    return categories, grand_total
+
+def build_client_records(baseline_clients, current_clients):
+    """Сопоставляет клиентов между baseline (2025) и текущим годом (2026)."""
+    keys = set(baseline_clients) | set(current_clients)
+    records = []
+    for manager, client in keys:
+        y2025 = baseline_clients.get((manager, client), 0.0)
+        y2026 = current_clients.get((manager, client), 0.0)
+
+        if y2025 == 0 and y2026 > 0:
+            status, delta_pct = "new", None
+        elif y2025 > 0 and y2026 == 0:
+            status, delta_pct = "lost", -100.0
+        else:
+            delta_pct = (y2026 - y2025) / abs(y2025) * 100 if y2025 != 0 else 0.0
+            if abs(delta_pct) <= 15:
+                status = "flat"
+            elif delta_pct > 0:
+                status = "up"
+            else:
+                status = "down"
+
+        records.append({
+            "manager": manager,
+            "client": client,
+            "y2025": round(y2025, 2),
+            "y2026": round(y2026, 2),
+            "status": status,
+            "deltaPct": round(delta_pct, 1) if delta_pct is not None else None,
+        })
+    return records
+
+
+def build_products_dict(baseline_products, current_products):
+    """Строит products{"Менеджер||Клиент": [{category, product, y2025, y2026}]}."""
+    keys = set(baseline_products) | set(current_products)
+    result = {}
+    for manager, client in keys:
+        dict_key = "{}||{}".format(manager, client)
+        b = baseline_products.get((manager, client), {})
+        c = current_products.get((manager, client), {})
+        pkeys = set(b) | set(c)
+        items = []
+        for category, product in pkeys:
+            items.append({
+                "category": category,
+                "product": product,
+                "y2025": round(b.get((category, product), 0.0), 2),
+                "y2026": round(c.get((category, product), 0.0), 2),
+            })
+        result[dict_key] = items
+    return result
 
 
 def main():
@@ -275,15 +364,20 @@ def main():
 
     baseline_file = os.path.join(BASE_DIR, cfg["current_period"]["baseline_file"])
     print("Parsing baseline file: {}".format(baseline_file))
-    baseline_categories, baseline_total = parse_xlsx_categories(baseline_file)
+    baseline_total, baseline_clients, baseline_products = parse_report_tree(baseline_file)
 
     print("Parsing new file: {}".format(new_file))
-    current_categories, current_total = parse_xlsx_categories(new_file)
-
-    vocabulary = set(baseline_categories) | set(current_categories)
-    print("Category vocabulary size: {}".format(len(vocabulary)))
+    current_total, current_clients, current_products = parse_report_tree(new_file)
 
     print("Baseline total: {:.2f} | Current total: {:.2f}".format(baseline_total, current_total))
+    print("Baseline clients: {} | Current clients: {}".format(len(baseline_clients), len(current_clients)))
+
+    clients = build_client_records(baseline_clients, current_clients)
+    products = build_products_dict(baseline_products, current_products)
+
+    new_count = sum(1 for c in clients if c["status"] == "new")
+    lost_count = sum(1 for c in clients if c["status"] == "lost")
+    print("Clients matched: {} total | {} new | {} lost".format(len(clients), new_count, lost_count))
 
     dash_cfg = cfg["dashboard"]
     api_url = dash_cfg["api_url"]
@@ -305,11 +399,16 @@ def main():
     months = current.get("months") or []
 
     period = cfg["current_period"]
+    period_label = period["month_label"].rstrip(",").strip()
     new_entry = {
         "id": period["month_id"],
-        "label": period["month_label"],
-        "categories": current_categories,
-        "total": current_total,
+        "label": period_label,
+        "baseYear": 2025,
+        "curYear": 2026,
+        "hasCompare": True,
+        "periodLabel": period_label,
+        "clients": clients,
+        "products": products,
     }
 
     found = False
