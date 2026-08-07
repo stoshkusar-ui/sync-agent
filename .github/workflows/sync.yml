@@ -1,0 +1,39 @@
+name: Sync Otgruzki Astana
+
+on:
+  schedule:
+    # 09:00 по времени Астаны (UTC+5) = 04:00 UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests openpyxl
+
+      - name: Run sync.py
+        env:
+          IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+          UPLOAD_TOKEN: ${{ secrets.UPLOAD_TOKEN }}
+        run: python sync.py
+
+      - name: Persist last processed email UID
+        run: |
+          git config user.name "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+          git add state/last_uid.txt
+          git diff --cached --quiet || git commit -m "Update last processed email UID [skip ci]"
+          git push
