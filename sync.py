@@ -24,6 +24,8 @@ import json
 import os
 import imaplib
 import email
+import calendar
+from datetime import datetime, timezone, timedelta
 from email.header import decode_header
 
 import requests
@@ -398,6 +400,12 @@ def main():
 
     months = current.get("months") or []
 
+    # Текущая дата по времени Астаны (UTC+5) — нужна для прогноза "к концу
+    # месяца" на дашборде: сколько дней уже прошло и сколько всего дней в месяце.
+    astana_now = datetime.now(timezone.utc) + timedelta(hours=5)
+    as_of_day = astana_now.day
+    days_in_month = calendar.monthrange(astana_now.year, astana_now.month)[1]
+
     period = cfg["current_period"]
     period_label = period["month_label"].rstrip(",").strip()
     new_entry = {
@@ -407,6 +415,8 @@ def main():
         "curYear": 2026,
         "hasCompare": True,
         "periodLabel": period_label,
+        "asOfDay": as_of_day,
+        "daysInMonth": days_in_month,
         "clients": clients,
         "products": products,
     }
