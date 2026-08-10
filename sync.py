@@ -236,6 +236,7 @@ def parse_report_tree(filepath):
     path = {}
     current_manager = None
     current_client = None
+    manager_own_sum = {}  # диагностика: собственная сумма строки менеджера (level=1)
 
     for r in range(header_row_idx + 1, ws.max_row + 1):
         level = ws.row_dimensions[r].outline_level if r in ws.row_dimensions else 0
@@ -263,6 +264,11 @@ def parse_report_tree(filepath):
         if level == 1:
             current_manager = name
             current_client = None
+            if sum_val is not None:
+                try:
+                    manager_own_sum[name] = float(sum_val)
+                except (TypeError, ValueError):
+                    pass
             continue
 
         if level == 2:
@@ -299,6 +305,23 @@ def parse_report_tree(filepath):
 
     if grand_total is None:
         raise ValueError("Could not find top-level total row in {}".format(filepath))
+
+    # Диагностика: сверяем собственную сумму каждого менеджера с суммой
+    # клиентов, захваченных под ним, чтобы найти "потерянные" ветки
+    manager_clients_sum = {}
+    for (mgr, _cl), amount in clients.items():
+        manager_clients_sum[mgr] = manager_clients_sum.get(mgr, 0.0) + amount
+
+    print("--- gap diagnostics for {} ---".format(os.path.basename(filepath)))
+    total_gap = 0.0
+    for mgr, own in manager_own_sum.items():
+        captured = manager_clients_sum.get(mgr, 0.0)
+        gap = own - captured
+        total_gap += gap
+        flag = "  <-- GAP" if abs(gap) > 1 else ""
+        print("  {:55s} own={:>14.2f} captured={:>14.2f}{}".format(mgr, own, captured, flag))
+    print("Total gap across all managers: {:.2f}".format(total_gap))
+    print("--- end gap diagnostics ---")
 
     return grand_total, clients, products
 
