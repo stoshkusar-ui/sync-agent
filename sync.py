@@ -178,28 +178,28 @@ def parse_report_tree(filepath):
     Парсит иерархический отчёт 1С, используя реальные уровни группировки
     Excel (outline_level), а не визуальные отступы.
 
-    Структура (подтверждена диагностикой файла):
+    Структура:
         level 0: "Астана Подразделение" (департамент, итоговая сумма)
         level 1: менеджер/отдел
-        level 2: РАЙОН (для менеджеров с "МПП" в названии) ИЛИ сразу КЛИЕНТ
-                 (для внутренних отделов: Ремонт Астана, Розница Астана,
-                 Розница МСЦ, Сотрудники Астана — у них нет уровня "район")
-        level 3: клиент (для веток с районом) ИЛИ категория (для веток без района)
-        далее вглубь: категория/подкатегория/... /товар (строка с Артикулом)
+        level 2: либо РАЙОН (если между ним и товаром есть ещё уровень
+                 клиента), либо сразу КЛИЕНТ (если товар всего в 2 уровнях
+                 ниже — район>категория>товар не помещается)
+
+    Определяем район/клиент НЕ по жёсткому списку менеджеров, а динамически
+    для каждой ветки: смотрим минимальную глубину до ближайшей строки-товара
+    (с Артикулом) под этим узлом level=2.
+        - Если минимальная глубина == 2 (сразу категория, потом товар) —
+          узел level=2 сам является клиентом.
+        - Если минимальная глубина >= 3 — узел level=2 это район, а
+          настоящий клиент находится на level=3.
+    Это надёжно работает и для менеджеров со смешанной структурой (когда
+    часть их клиентов идёт через район, а часть — напрямую).
 
     Возвращает (grand_total, clients, products):
         grand_total - число, сумма по всему департаменту
         clients     - dict {(manager, client): сумма}
         products    - dict {(manager, client): {(category, product): сумма}}
     """
-    # Отделы, где нет промежуточного уровня "район" между менеджером и клиентом
-    NO_DISTRICT_MANAGERS = {
-        "Ремонт Астана",
-        "Розница Астана",
-        "Розница МСЦ",
-        "Сотрудники Астана",
-    }
-
     wb = load_workbook(filepath, data_only=True)
     ws = wb.active
 
@@ -230,23 +230,49 @@ def parse_report_tree(filepath):
             col_article = idx + 1
             break
 
-    grand_total = None
-    clients = {}
-    products = {}
-    path = {}
-    current_manager = None
-    current_client = None
-    manager_own_sum = {}  # диагностика: собственная сумма строки менеджера (level=1)
-
+    # Первый проход: считываем все строки в список (нужно для "заглядывания
+    # вперёд" при определении район/клиент)
+    rows_data = []
     for r in range(header_row_idx + 1, ws.max_row + 1):
         level = ws.row_dimensions[r].outline_level if r in ws.row_dimensions else 0
         name = ws.cell(row=r, column=1).value
         if name is None:
             continue
         name = str(name).strip()
-
         sum_val = ws.cell(row=r, column=col_sum).value
         article = ws.cell(row=r, column=col_article).value if col_article else None
+        rows_data.append({"level": level, "name": name, "sum": sum_val, "article": article})
+
+    def is_level2_a_client(start_idx, level2):
+        """Смотрит вперёд от строки level=2 до следующей строки того же или
+        более высокого уровня, ищет минимальную глубину до товара (Артикул)."""
+        min_rel = None
+        j = start_idx + 1
+        while j < len(rows_data) and rows_data[j]["level"] > level2:
+            rd = rows_data[j]
+            if rd["article"]:
+                rel = rd["level"] - level2
+                if min_rel is None or rel < min_rel:
+                    min_rel = rel
+            j += 1
+        if min_rel is None:
+            return True  # нет товаров внутри — считаем клиентом по умолчанию
+        return min_rel == 2
+
+    grand_total = None
+    clients = {}
+    products = {}
+    path = {}
+    current_manager = None
+    current_client = None
+    level2_is_district = False
+    manager_own_sum = {}  # диагностика
+
+    for idx, rd in enumerate(rows_data):
+        level = rd["level"]
+        name = rd["name"]
+        sum_val = rd["sum"]
+        article = rd["article"]
 
         path[level] = name
         for lv in list(path.keys()):
@@ -264,6 +290,7 @@ def parse_report_tree(filepath):
         if level == 1:
             current_manager = name
             current_client = None
+            level2_is_district = False
             if sum_val is not None:
                 try:
                     manager_own_sum[name] = float(sum_val)
@@ -272,26 +299,32 @@ def parse_report_tree(filepath):
             continue
 
         if level == 2:
-            if current_manager in NO_DISTRICT_MANAGERS:
+            if is_level2_a_client(idx, level):
                 current_client = name
+                level2_is_district = False
                 if sum_val is not None:
                     try:
                         clients[(current_manager, current_client)] = float(sum_val)
                     except (TypeError, ValueError):
                         pass
+            else:
+                current_client = None
+                level2_is_district = True  # настоящий клиент будет на level=3
             continue
 
-        if level == 3:
-            if current_manager not in NO_DISTRICT_MANAGERS:
-                current_client = name
-                if sum_val is not None:
-                    try:
-                        clients[(current_manager, current_client)] = float(sum_val)
-                    except (TypeError, ValueError):
-                        pass
+        if level == 3 and level2_is_district:
+            # под этим районом может быть несколько клиентов подряд —
+            # флаг level2_is_district остаётся True для всех них
+            current_client = name
+            if sum_val is not None:
+                try:
+                    clients[(current_manager, current_client)] = float(sum_val)
+                except (TypeError, ValueError):
+                    pass
             continue
 
-        # Уровни глубже клиента: категории/подкатегории/товары
+        # Всё остальное (включая level=3, если level=2 уже был клиентом) —
+        # категории/подкатегории/товары
         if article and current_manager and current_client and sum_val is not None:
             category = path.get(level - 1, "")
             try:
@@ -307,7 +340,7 @@ def parse_report_tree(filepath):
         raise ValueError("Could not find top-level total row in {}".format(filepath))
 
     # Диагностика: сверяем собственную сумму каждого менеджера с суммой
-    # клиентов, захваченных под ним, чтобы найти "потерянные" ветки
+    # клиентов, захваченных под ним, чтобы убедиться, что ничего не потеряно
     manager_clients_sum = {}
     for (mgr, _cl), amount in clients.items():
         manager_clients_sum[mgr] = manager_clients_sum.get(mgr, 0.0) + amount
