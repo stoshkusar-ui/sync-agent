@@ -173,7 +173,7 @@ def find_and_download_email(cfg):
     return saved_path
 
 
-def parse_report_tree(filepath):
+def parse_report_tree(filepath, district_map=None):
     """
     Парсит иерархический отчёт 1С, используя реальные уровни группировки
     Excel (outline_level), а не визуальные отступы.
@@ -185,21 +185,28 @@ def parse_report_tree(filepath):
                  клиента), либо сразу КЛИЕНТ (если товар всего в 2 уровнях
                  ниже — район>категория>товар не помещается)
 
-    Определяем район/клиент НЕ по жёсткому списку менеджеров, а динамически
-    для каждой ветки: смотрим минимальную глубину до ближайшей строки-товара
-    (с Артикулом) под этим узлом level=2.
-        - Если минимальная глубина == 2 (сразу категория, потом товар) —
-          узел level=2 сам является клиентом.
-        - Если минимальная глубина >= 3 — узел level=2 это район, а
-          настоящий клиент находится на level=3.
-    Это надёжно работает и для менеджеров со смешанной структурой (когда
-    часть их клиентов идёт через район, а часть — напрямую).
+    Определяем район/клиент динамически для каждой ветки: смотрим
+    минимальную глубину до ближайшей строки-товара (с Артикулом) под
+    этим узлом level=2. НО поскольку эта глубина зависит от фактических
+    данных периода (в одном периоде клиент мог купить больше видов
+    товара, что меняет глубину дерева), между baseline и текущим файлом
+    один и тот же клиент может определиться по-разному, из-за чего
+    сопоставление имён между годами ломается.
 
-    Возвращает (grand_total, clients, products):
+    Чтобы этого избежать: если передан district_map (словарь решений,
+    полученный при разборе baseline), используем ЕГО для всех уже
+    известных узлов (manager, level2_name), и только для действительно
+    новых веток (которых не было в baseline) решаем заново по глубине.
+
+    Возвращает (grand_total, clients, products, district_map):
         grand_total - число, сумма по всему департаменту
         clients     - dict {(manager, client): сумма}
         products    - dict {(manager, client): {(category, product): сумма}}
+        district_map- dict {(manager, level2_name): is_client(bool)} —
+                       принятые решения, чтобы передать их в следующий вызов
     """
+    if district_map is None:
+        district_map = {}
     wb = load_workbook(filepath, data_only=True)
     ws = wb.active
 
@@ -299,7 +306,14 @@ def parse_report_tree(filepath):
             continue
 
         if level == 2:
-            if is_level2_a_client(idx, level):
+            map_key = (current_manager, name)
+            if map_key in district_map:
+                is_client = district_map[map_key]
+            else:
+                is_client = is_level2_a_client(idx, level)
+                district_map[map_key] = is_client
+
+            if is_client:
                 current_client = name
                 level2_is_district = False
                 if sum_val is not None:
@@ -356,7 +370,7 @@ def parse_report_tree(filepath):
     print("Total gap across all managers: {:.2f}".format(total_gap))
     print("--- end gap diagnostics ---")
 
-    return grand_total, clients, products
+    return grand_total, clients, products, district_map
 
 
 def build_client_records(baseline_clients, current_clients):
@@ -422,10 +436,10 @@ def main():
 
     baseline_file = os.path.join(BASE_DIR, cfg["current_period"]["baseline_file"])
     print("Parsing baseline file: {}".format(baseline_file))
-    baseline_total, baseline_clients, baseline_products = parse_report_tree(baseline_file)
+    baseline_total, baseline_clients, baseline_products, district_map = parse_report_tree(baseline_file)
 
     print("Parsing new file: {}".format(new_file))
-    current_total, current_clients, current_products = parse_report_tree(new_file)
+    current_total, current_clients, current_products, _ = parse_report_tree(new_file, district_map=district_map)
 
     print("Baseline total: {:.2f} | Current total: {:.2f}".format(baseline_total, current_total))
     print("Baseline clients: {} | Current clients: {}".format(len(baseline_clients), len(current_clients)))
