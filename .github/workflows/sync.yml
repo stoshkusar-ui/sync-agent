@@ -2,8 +2,7 @@ name: Sync Otgruzki Astana
 
 on:
   schedule:
-    # 09:00 по времени Астаны (UTC+5) = 04:00 UTC
-    - cron: '0 4 * * *'
+    - cron: '*/30 4-13 * * *'
   workflow_dispatch: {}
 
 permissions:
