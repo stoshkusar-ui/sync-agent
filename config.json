@@ -15,9 +15,9 @@
         "api_url": "https://otgruzki-astana.pages.dev/api/data",
         "upload_token": ""
     },
-    "current_period": {
-        "month_id": "august",
-        "month_label": "Август,",
-        "baseline_file": "baseline/baseline_aug2025.xlsx"
+        "current_period": {
+        "month_id": "september",
+        "month_label": "Сентябрь,",
+        "baseline_file": "baseline/baseline_sep2025.xlsx"
     }
 }
