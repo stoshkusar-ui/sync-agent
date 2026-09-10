@@ -190,51 +190,64 @@ def parse_report_tree(filepath, district_map=None):
     Парсит иерархический отчёт 1С, используя реальные уровни группировки
     Excel (outline_level), а не визуальные отступы.
 
-    Структура:
-        level 0: "Астана Подразделение" (департамент, итоговая сумма)
-        level 1: менеджер/отдел
-        level 2: либо РАЙОН (если между ним и товаром есть ещё уровень
-                 клиента), либо сразу КЛИЕНТ (если товар всего в 2 уровнях
-                 ниже — район>категория>товар не помещается)
+    Структура под менеджером (level=1) переменной глубины:
+        level 2: КЛИЕНТ, либо начало административного дерева произвольной
+                 глубины — РАЙОН (level=2) -> ГОРОД/НАСЕЛЁННЫЙ ПУНКТ
+                 (level=3) -> ... -> КЛИЕНТ, и только под настоящим
+                 клиентом идут категория(и)/подкатегория(и)/товар.
 
-    Определяем район/клиент динамически для каждой ветки: смотрим
-    минимальную глубину до ближайшей строки-товара (с Артикулом) под
-    этим узлом level=2. НО эта глубина зависит от фактической структуры
-    товарных категорий конкретного клиента в конкретном периоде: если у
-    клиента есть категория с дополнительной вложенной подкатегорией
-    (например "Столярный инструмент" -> "Ножовки, пилы двуручные" ->
-    товар, лишний уровень по сравнению с обычным "категория -> товар"),
-    минимальная глубина от level=2 до товара СЛУЧАЙНО совпадает с
-    сигнатурой "район -> клиент -> категория -> товар", и алгоритм
-    ошибочно считает такого клиента районом, а его собственные товарные
-    категории — отдельными "клиентами" (были замечены случаи:
-    "Распродажа", "Ручной инструмент", "Насосы", "Сварочные аппараты",
-    "Стабилизаторы, ЛАТры" и другие категории попадали в список клиентов).
+    Раньше определяли район/клиент по фиксированной глубине до ближайшего
+    товара (Артикул): "2 уровня — клиент, 3 уровня — район с клиентом на
+    level=3". Это ломалось в двух случаях:
+      1) у клиента есть категория с лишней вложенной подкатегорией
+         (например "Столярный инструмент" -> "Ножовки, пилы двуручные" ->
+         товар) — глубина случайно совпадала с сигнатурой района, и
+         клиента ошибочно считали районом, а его собственные категории —
+         отдельными "клиентами" (случаи "Распродажа", "Ручной инструмент",
+         "Насосы", "Сварочные аппараты", "Стабилизаторы, ЛАТры" и т.п.
+         попадали в список клиентов);
+      2) встречается административная вложенность ГЛУБЖЕ одного уровня:
+         РАЙОН -> ГОРОД -> клиент (например "Бурабайский район" ->
+         "Щучинск" -> "Иванов Дмитрий Борисович ИП" и другие клиенты) —
+         фиксированная схема "либо 2, либо 3" такое не поддерживала
+         вообще, и весь город "Щучинск" со всеми клиентами внутри него
+         схлопывался в одну общую строку-"клиента" с именем города.
 
-    Чтобы это исправить, глубина используется только как ПЕРВИЧНАЯ
-    подсказка. Если по глубине узел level=2 похож на район, дополнительно
-    проверяем: являются ли имена его непосредственных потомков (level=3)
-    известными "родовыми" названиями товарных категорий, т.е. встречаются
-    ли они как внутренние узлы (не товарные строки) под НЕСКОЛЬКИМИ
-    другими ветками level=2 в этом же файле (см. CATEGORY_VOCAB_MIN_BRANCHES
-    и build_category_vocab). Если да — узел level=2 почти наверняка
-    настоящий клиент, а не район, и мы переопределяем решение.
-    Такое переопределение никогда не работает в обратную сторону (не
-    превращает клиента, определённого по глубине, в район) — это
-    осознанно консервативный, только "спасающий" фикс.
+    Теперь классификация полностью рекурсивная и не привязана к
+    конкретному уровню вложенности (см. classify_node ниже):
+      - Если минимальная глубина до ближайшего товара под узлом равна 2
+        (обычный клиент -> категория -> товар) — узел точно клиент.
+      - Если товаров под узлом нет вовсе — узел считается клиентом по
+        умолчанию (как раньше).
+      - Иначе (глубина больше 2, т.е. неоднозначно) смотрим на имена
+        непосредственных потомков узла: если хотя бы одно из них —
+        известное "родовое" название товарной категории (т.е. оно
+        встречается как внутренний, не товарный узел под НЕСКОЛЬКИМИ
+        другими ветками level=2 в этом же файле, см.
+        CATEGORY_VOCAB_MIN_BRANCHES и build_category_vocab) — узел
+        признаётся клиентом (его потомки — категории, не под-клиенты).
+      - Иначе узел считается административным (район/город/т.п.) и мы
+        рекурсивно применяем те же правила к КАЖДОМУ его непосредственному
+        потомку — так поддерживается произвольная глубина вложенности
+        (район -> город -> клиент, и глубже, если понадобится).
+    Переопределение относительно старой "глубина==2" эвристики работает
+    только в одну сторону — узел, который по глубине уже однозначно
+    клиент, никогда не превращается в административный. Это осознанно
+    консервативный фикс, минимизирующий риск сломать уже корректно
+    работающие случаи.
 
     Дополнительно: чтобы между baseline и текущим файлом один и тот же
-    клиент не определялся по-разному (из-за разной глубины дерева в
+    узел не классифицировался по-разному (из-за разной глубины дерева в
     разные периоды), если передан district_map (словарь решений,
     полученный при разборе baseline), используем ЕГО для всех уже
-    известных узлов (manager, level2_name), и только для действительно
-    новых веток (которых не было в baseline) решаем заново.
+    известных узлов (manager, node_name), и только для действительно
+    новых узлов (которых не было в baseline) решаем заново.
 
     Возвращает (grand_total, clients, products, district_map):
         grand_total - число, сумма по всему департаменту
         clients     - dict {(manager, client): сумма}
         products    - dict {(manager, client): {(category, product): сумма}}
-        district_map- dict {(manager, level2_name): is_client(bool)} —
+        district_map- dict {(manager, node_name): "client"|"admin"} —
                        принятые решения, чтобы передать их в следующий вызов
     """
     if district_map is None:
@@ -304,50 +317,74 @@ def parse_report_tree(filepath, district_map=None):
 
     category_vocab = build_category_vocab()
 
-    def immediate_children_names(start_idx, level2):
-        """Имена непосредственных потомков (level2+1) узла level=2."""
-        names = []
+    def node_end(start_idx, level):
+        """Индекс строки СРАЗУ ПОСЛЕ поддерева узла rows_data[start_idx]."""
         j = start_idx + 1
-        while j < len(rows_data) and rows_data[j]["level"] > level2:
-            if rows_data[j]["level"] == level2 + 1:
-                names.append(rows_data[j]["name"])
+        while j < len(rows_data) and rows_data[j]["level"] > level:
             j += 1
-        return names
+        return j
 
-    def is_level2_a_client(start_idx, level2):
-        """Смотрит вперёд от строки level=2 до следующей строки того же или
-        более высокого уровня, ищет минимальную глубину до товара (Артикул).
-        Если по глубине узел похож на район (min_rel != 2), дополнительно
-        проверяет по словарю категорий (category_vocab): если хотя бы один
-        непосредственный потомок — известное родовое название категории,
-        значит сам узел level=2 — настоящий клиент, а не район (глубина
-        обманула из-за лишнего уровня вложенности подкатегорий у этого
-        конкретного клиента)."""
+    def immediate_children(start_idx, level):
+        """Индексы непосредственных потомков (level+1) узла rows_data[start_idx]."""
+        children = []
+        j = start_idx + 1
+        end = node_end(start_idx, level)
+        while j < end:
+            if rows_data[j]["level"] == level + 1:
+                children.append(j)
+            j += 1
+        return children
+
+    def min_rel_depth(start_idx, level):
+        """Минимальная глубина (в уровнях) от узла до ближайшей строки-
+        товара (с Артикулом) в его поддереве, или None, если товаров нет."""
         min_rel = None
         j = start_idx + 1
-        while j < len(rows_data) and rows_data[j]["level"] > level2:
+        end = node_end(start_idx, level)
+        while j < end:
             rd = rows_data[j]
             if rd["article"]:
-                rel = rd["level"] - level2
+                rel = rd["level"] - level
                 if min_rel is None or rel < min_rel:
                     min_rel = rel
             j += 1
-        if min_rel is None:
-            return True  # нет товаров внутри — считаем клиентом по умолчанию
-        if min_rel == 2:
-            return True
+        return min_rel
 
-        children = immediate_children_names(start_idx, level2)
-        vocab_hits = [c for c in children if c in category_vocab]
-        if children and vocab_hits:
-            name = rows_data[start_idx]["name"]
-            print(
-                "  [district-fix] '{}' переопределён как КЛИЕНТ (не район): "
-                "среди дочерних узлов найдены известные категории {}".format(name, vocab_hits)
-            )
-            return True
+    client_row_idx = set()
 
-        return False
+    def classify_node(idx, level, manager):
+        """Рекурсивно определяет, является ли узел (idx, level) настоящим
+        клиентом, или промежуточным административным узлом (район/город/
+        и т.п.). Во втором случае рекурсивно спускается к каждому
+        непосредственному потомку и классифицирует их точно так же —
+        поддерживается произвольная глубина административной вложенности.
+        Найденные клиентские строки добавляются в client_row_idx."""
+        name = rows_data[idx]["name"]
+        key = (manager, name)
+        if key in district_map:
+            decision = district_map[key]
+        else:
+            min_rel = min_rel_depth(idx, level)
+            if min_rel is None or min_rel == 2:
+                decision = "client"
+            else:
+                children = immediate_children(idx, level)
+                vocab_hits = [rows_data[c]["name"] for c in children if rows_data[c]["name"] in category_vocab]
+                if children and vocab_hits:
+                    decision = "client"
+                    print(
+                        "  [district-fix] '{}' переопределён как КЛИЕНТ (не район): "
+                        "среди дочерних узлов найдены известные категории {}".format(name, vocab_hits)
+                    )
+                else:
+                    decision = "admin"
+            district_map[key] = decision
+
+        if decision == "client":
+            client_row_idx.add(idx)
+        else:
+            for child_idx in immediate_children(idx, level):
+                classify_node(child_idx, level + 1, manager)
 
     grand_total = None
     clients = {}
@@ -355,7 +392,7 @@ def parse_report_tree(filepath, district_map=None):
     path = {}
     current_manager = None
     current_client = None
-    level2_is_district = False
+    current_client_level = None
     manager_own_sum = {}  # диагностика
 
     for idx, rd in enumerate(rows_data):
@@ -380,7 +417,7 @@ def parse_report_tree(filepath, district_map=None):
         if level == 1:
             current_manager = name
             current_client = None
-            level2_is_district = False
+            current_client_level = None
             if sum_val is not None:
                 try:
                     manager_own_sum[name] = float(sum_val)
@@ -389,30 +426,21 @@ def parse_report_tree(filepath, district_map=None):
             continue
 
         if level == 2:
-            map_key = (current_manager, name)
-            if map_key in district_map:
-                is_client = district_map[map_key]
-            else:
-                is_client = is_level2_a_client(idx, level)
-                district_map[map_key] = is_client
+            # Вершина административного/клиентского поддерева под менеджером —
+            # рекурсивно классифицируем весь этот участок дерева заранее
+            # (client_row_idx будет содержать индексы всех настоящих
+            # клиентов, найденных на любой глубине внутри этого поддерева).
+            classify_node(idx, level, current_manager)
 
-            if is_client:
-                current_client = name
-                level2_is_district = False
-                if sum_val is not None:
-                    try:
-                        clients[(current_manager, current_client)] = float(sum_val)
-                    except (TypeError, ValueError):
-                        pass
-            else:
-                current_client = None
-                level2_is_district = True  # настоящий клиент будет на level=3
-            continue
+        # Если мы поднялись на уровень текущего клиента или выше (новая
+        # ветка/сосед), значит вышли из его поддерева — сбрасываем.
+        if current_client_level is not None and level <= current_client_level:
+            current_client = None
+            current_client_level = None
 
-        if level == 3 and level2_is_district:
-            # под этим районом может быть несколько клиентов подряд —
-            # флаг level2_is_district остаётся True для всех них
+        if idx in client_row_idx:
             current_client = name
+            current_client_level = level
             if sum_val is not None:
                 try:
                     clients[(current_manager, current_client)] = float(sum_val)
@@ -420,8 +448,10 @@ def parse_report_tree(filepath, district_map=None):
                     pass
             continue
 
-        # Всё остальное (включая level=3, если level=2 уже был клиентом) —
-        # категории/подкатегории/товары
+        # Промежуточные административные узлы (район/город/т.п.) просто
+        # пропускаются — ничего не добавляем, current_client не трогаем.
+        # Всё остальное под уже определённым клиентом — категории/
+        # подкатегории/товары.
         if article and current_manager and current_client and sum_val is not None:
             category = path.get(level - 1, "")
             try:
